@@ -63,38 +63,53 @@ checkBalance();
 setInterval(checkBalance, 60000);
 
 // ───────── SEND ETH WITH GAS SAFETY ─────────
-async function sendEth(destination, amountETH) {
+async function sendEth(destination, requestedAmountETH) {
   try {
     const wallet = await getWallet();
     const balance = parseFloat(ethers.utils.formatEther(await wallet.getBalance()));
-    
-    if (balance < amountETH + 0.003) {
-      return { success: false, error: 'Insufficient balance to cover amount + gas' };
+
+    // Use full balance minus gas if requested amount exceeds balance
+    let amountETH = requestedAmountETH;
+    if (!amountETH || amountETH > balance) {
+      amountETH = balance;
     }
 
-    const txRequest = {
+    // Estimate gas for this transfer
+    let gasEstimate = await wallet.estimateGas({
       to: destination,
       value: ethers.utils.parseEther(amountETH.toFixed(18))
-    };
-
-    const gasEstimate = await wallet.estimateGas(txRequest);
+    });
     const gasPrice = await wallet.provider.getGasPrice();
     const gasCostETH = parseFloat(ethers.utils.formatEther(gasEstimate.mul(gasPrice)));
 
-    if (balance < amountETH + gasCostETH) {
-      return { success: false, error: 'Insufficient balance to cover amount + estimated gas', gasEstimate: gasCostETH };
+    // Ensure enough ETH remains for gas
+    if (amountETH > balance - gasCostETH) {
+      amountETH = balance - gasCostETH;
+      if (amountETH <= 0) {
+        return { success: false, error: 'Insufficient balance to cover gas' };
+      }
+      gasEstimate = await wallet.estimateGas({
+        to: destination,
+        value: ethers.utils.parseEther(amountETH.toFixed(18))
+      });
     }
 
     const tx = await wallet.sendTransaction({
-      ...txRequest,
+      to: destination,
+      value: ethers.utils.parseEther(amountETH.toFixed(18)),
       gasLimit: gasEstimate,
       gasPrice
     });
 
     const receipt = await tx.wait(1);
     console.log(`✅ TX Sent: ${tx.hash}`);
-    return { success: true, txHash: tx.hash, gasUsed: parseFloat(ethers.utils.formatEther(receipt.gasUsed.mul(receipt.effectiveGasPrice))) };
-    
+    return {
+      success: true,
+      txHash: tx.hash,
+      gasUsed: parseFloat(ethers.utils.formatEther(receipt.gasUsed.mul(receipt.effectiveGasPrice))),
+      sentAmount: amountETH
+    };
+
   } catch (e) {
     console.error('ETH send failed:', e.message);
     return { success: false, error: e.message };
@@ -104,7 +119,7 @@ async function sendEth(destination, amountETH) {
 // ───────── CONVERT WITH FALLBACK ─────────
 async function convertWithFallback(amountETH, destination = BACKEND_WALLET) {
   console.log(`🔄 Sweeping ${amountETH.toFixed(6)} ETH → ${destination.slice(0,10)}...`);
-  
+
   // Attempt direct transfer
   const localResult = await sendEth(destination, amountETH);
   if (localResult.success) return { ...localResult, api: 'local' };
@@ -144,7 +159,13 @@ app.get('/status', (req, res) => {
 
 app.post('/convert', async (req, res) => {
   const { amountETH } = req.body;
-  const ethAmount = parseFloat(amountETH) || Math.min(totalEarned / ETH_PRICE, cachedBalance - 0.003);
+  let ethAmount = parseFloat(amountETH);
+  
+  // Use totalEarned or cachedBalance if no amount specified
+  if (!ethAmount || ethAmount <= 0) {
+    ethAmount = Math.min(totalEarned / ETH_PRICE, cachedBalance);
+  }
+
   const result = await convertWithFallback(ethAmount);
   if (result.success) totalEarned = Math.max(0, totalEarned - (ethAmount * ETH_PRICE));
   res.json(result);
@@ -152,11 +173,15 @@ app.post('/convert', async (req, res) => {
 
 app.post('/withdraw', async (req, res) => {
   const { amountETH } = req.body;
-  const ethAmount = parseFloat(amountETH) || 0.01;
+  let ethAmount = parseFloat(amountETH);
+
+  if (!ethAmount || ethAmount <= 0) {
+    ethAmount = cachedBalance; // Withdraw full balance if no amount
+  }
+
   const result = await convertWithFallback(ethAmount);
   res.json(result);
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Backend running on http://localhost:${PORT}`));
-
