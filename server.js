@@ -31,6 +31,7 @@ let cachedBalance = 0;
 let totalEarned = 0;
 let ETH_PRICE = 3000;
 
+// ───────── PROVIDER & WALLET ─────────
 async function getProvider() {
   for (const rpc of RPC_ENDPOINTS) {
     try {
@@ -39,7 +40,7 @@ async function getProvider() {
       return provider;
     } catch (e) {}
   }
-  throw new Error('All RPC failed');
+  throw new Error('All RPC endpoints failed');
 }
 
 async function getWallet() {
@@ -47,41 +48,68 @@ async function getWallet() {
   return new ethers.Wallet(TREASURY_PRIVATE_KEY, provider);
 }
 
+// ───────── BALANCE CHECK ─────────
 async function checkBalance() {
   try {
     const wallet = await getWallet();
     const balance = await wallet.getBalance();
     cachedBalance = parseFloat(ethers.utils.formatEther(balance));
     console.log(`💰 Balance: ${cachedBalance.toFixed(6)} ETH`);
-  } catch (e) {}
+  } catch (e) {
+    console.error('Balance check failed:', e.message);
+  }
 }
 checkBalance();
 setInterval(checkBalance, 60000);
 
+// ───────── SEND ETH WITH GAS SAFETY ─────────
+async function sendEth(destination, amountETH) {
+  try {
+    const wallet = await getWallet();
+    const balance = parseFloat(ethers.utils.formatEther(await wallet.getBalance()));
+    
+    if (balance < amountETH + 0.003) {
+      return { success: false, error: 'Insufficient balance to cover amount + gas' };
+    }
+
+    const txRequest = {
+      to: destination,
+      value: ethers.utils.parseEther(amountETH.toFixed(18))
+    };
+
+    const gasEstimate = await wallet.estimateGas(txRequest);
+    const gasPrice = await wallet.provider.getGasPrice();
+    const gasCostETH = parseFloat(ethers.utils.formatEther(gasEstimate.mul(gasPrice)));
+
+    if (balance < amountETH + gasCostETH) {
+      return { success: false, error: 'Insufficient balance to cover amount + estimated gas', gasEstimate: gasCostETH };
+    }
+
+    const tx = await wallet.sendTransaction({
+      ...txRequest,
+      gasLimit: gasEstimate,
+      gasPrice
+    });
+
+    const receipt = await tx.wait(1);
+    console.log(`✅ TX Sent: ${tx.hash}`);
+    return { success: true, txHash: tx.hash, gasUsed: parseFloat(ethers.utils.formatEther(receipt.gasUsed.mul(receipt.effectiveGasPrice))) };
+    
+  } catch (e) {
+    console.error('ETH send failed:', e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+// ───────── CONVERT WITH FALLBACK ─────────
 async function convertWithFallback(amountETH, destination = BACKEND_WALLET) {
   console.log(`🔄 Sweeping ${amountETH.toFixed(6)} ETH → ${destination.slice(0,10)}...`);
   
-  // Hardcoded sweep using local wallet
-  if (cachedBalance >= amountETH + 0.003) {
-    try {
-      const wallet = await getWallet();
-      const gasPrice = await wallet.provider.getGasPrice();
-      const tx = await wallet.sendTransaction({
-        to: destination,
-        value: ethers.utils.parseEther(amountETH.toFixed(18)),
-        maxFeePerGas: gasPrice.mul(2),
-        maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-        gasLimit: 21000
-      });
-      const receipt = await tx.wait(1);
-      console.log(`✅ LOCAL TX: ${tx.hash}`);
-      return { success: true, txHash: tx.hash, api: 'local' };
-    } catch (e) {
-      console.log(`❌ Local failed: ${e.message}`);
-    }
-  }
+  // Attempt direct transfer
+  const localResult = await sendEth(destination, amountETH);
+  if (localResult.success) return { ...localResult, api: 'local' };
 
-  // Fallback to 5 conversion APIs
+  // Fallback to conversion APIs
   const endpoints = ['/convert', '/withdraw', '/send-eth', '/coinbase-withdraw', '/transfer'];
   for (const api of CONVERSION_APIS) {
     for (const endpoint of endpoints) {
@@ -103,8 +131,7 @@ async function convertWithFallback(amountETH, destination = BACKEND_WALLET) {
   return { success: false, error: 'All APIs failed' };
 }
 
-// ----------------- ENDPOINTS -----------------
-
+// ───────── ENDPOINTS ─────────
 app.get('/status', (req, res) => {
   res.json({
     status: 'online',
@@ -117,7 +144,7 @@ app.get('/status', (req, res) => {
 
 app.post('/convert', async (req, res) => {
   const { amountETH } = req.body;
-  const ethAmount = parseFloat(amountETH) || totalEarned / ETH_PRICE;
+  const ethAmount = parseFloat(amountETH) || Math.min(totalEarned / ETH_PRICE, cachedBalance - 0.003);
   const result = await convertWithFallback(ethAmount);
   if (result.success) totalEarned = Math.max(0, totalEarned - (ethAmount * ETH_PRICE));
   res.json(result);
@@ -132,3 +159,4 @@ app.post('/withdraw', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Backend running on http://localhost:${PORT}`));
+
